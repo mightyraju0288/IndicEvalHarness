@@ -96,6 +96,14 @@ class TaskConfig(dict):
     should_decontaminate: bool = False
     doc_to_decontamination_query: Optional[str] = None
     gen_prefix: Optional[str] = None
+    # clustering: name of a doc field whose value groups non-independent
+    # questions (e.g. a shared passage / source id). When None (default), the
+    # task is treated as IID and no cluster information is emitted.
+    cluster_key: Optional[str] = None
+    # pass@k: list of k values to report unbiased pass@k for (e.g. [1, 3, 4]).
+    # Opt-in per task; requires K (=repeats) samples kept per question via the
+    # `avg_at_k` filter and repeats>1. None (default) -> no pass@k.
+    passk: Optional[list] = None
     metadata: Optional[dict] = (
         None  # by default, not used in the code. allows for users to pass arbitrary info to tasks
     )
@@ -886,6 +894,37 @@ class ConfigurableTask(Task):
             )
             self._filters = [build_filter_ensemble("none", [["take_first", None]])]
 
+        # --- safety checks for avg@k / pass@k ---
+        # Both features collapse K per-sample scores into one per-question score and
+        # require generate_until tasks with binary / exact_match-style metrics
+        # (per-sample 'mean' aggregation). They must NEVER be applied to corpus-level
+        # metrics (chrf/bleu/ter), whose per-sample values are not binary correctness
+        # and whose aggregation is not a per-sample mean.
+        _uses_avg_at_k = any(
+            isinstance(fn, dict) and fn.get("function") == "avg_at_k"
+            for fc in (self.config.filter_list or [])
+            if isinstance(fc, dict)
+            for fn in (fc.get("filter") or [])
+        )
+        if self.config.passk is not None or _uses_avg_at_k:
+            feature = "pass@k" if self.config.passk is not None else "avg@k"
+            if self.OUTPUT_TYPE != "generate_until":
+                raise ValueError(
+                    f"[Task: {self.config.task}] {feature} is only supported for "
+                    f"generate_until tasks, but output_type is '{self.OUTPUT_TYPE}'."
+                )
+            corpus_metrics = [
+                m for m, agg in self._aggregation_list.items() if agg is not mean
+            ]
+            if corpus_metrics:
+                raise ValueError(
+                    f"[Task: {self.config.task}] {feature} requires binary / "
+                    f"exact_match-style metrics (per-sample 'mean' aggregation), but "
+                    f"metric(s) {corpus_metrics} use a corpus-level aggregation "
+                    f"(e.g. chrf/bleu/ter). Remove the avg_at_k filter / passk config, "
+                    f"or score with a binary metric such as exact_match."
+                )
+
         if self.config.use_prompt is not None:
             eval_logger.info(f"loading prompt {self.config.use_prompt}")
             self.prompt = get_prompt(
@@ -1544,14 +1583,18 @@ class ConfigurableTask(Task):
 
     def process_results(self, doc, results):
         if callable(self.config.process_results):
-            return self.config.process_results(doc, results)
+            result_dict = self.config.process_results(doc, results)
+            cluster_key = getattr(self.config, "cluster_key", None)
+            if cluster_key is not None:
+                result_dict["__cluster__"] = doc.get(cluster_key)
+            return result_dict
 
         result_dict = {}
         use_metric = list(self._metric_fn_list.keys())
         if self.OUTPUT_TYPE == "loglikelihood":
             results = results[0]
             ll, is_greedy = results
-            return {
+            result_dict = {
                 **({"perplexity": ll} if "perplexity" in use_metric else {}),
                 **({"acc": int(is_greedy)} if "acc" in use_metric else {}),
             }
@@ -1559,7 +1602,7 @@ class ConfigurableTask(Task):
             (loglikelihood,) = results
             _words = self.count_words(self.doc_to_target(doc))
             _bytes = self.count_bytes(self.doc_to_target(doc))
-            return {
+            result_dict = {
                 **(
                     {"word_perplexity": (loglikelihood, _words)}
                     if "word_perplexity" in use_metric
@@ -1661,6 +1704,17 @@ class ConfigurableTask(Task):
         elif self.OUTPUT_TYPE == "generate_until":
             gold = self.doc_to_target(doc)
             result = results[0]
+            # avg@k: the `avg_at_k` filter keeps the K extracted answers as a list
+            # (instead of collapsing to one). Detect that here so we can score each
+            # of the K against gold and report the per-question mean (one value in
+            # [0, 1]); summarize() then runs the usual SE/CI layer over those means.
+            # Shipped filter pipelines always collapse to a scalar, so a list result
+            # uniquely signals the avg@k path.
+            is_avg_at_k = isinstance(result, list) and not self.multiple_target
+            # pass@k: when K answers are kept, capture the per-sample binary
+            # correctness vector (prefer exact_match) so the aggregation layer can
+            # build the (n_questions, K) matrix and compute unbiased pass@k.
+            passk_source = None
             if self.config.doc_to_choice is not None:
                 # If you set doc_to_choice,
                 # it assumes that doc_to_target returns a number.
@@ -1716,6 +1770,33 @@ class ConfigurableTask(Task):
                             result_score = 1.0
                         else:
                             result_score = 0.0
+                elif is_avg_at_k:
+                    # score each of the K extracted answers vs gold, then average
+                    per_sample = []
+                    for pred in result:
+                        gold_cast = gold
+                        if type(gold_cast) is not type(pred):
+                            try:
+                                gold_cast = type(pred)(gold_cast)
+                            except (TypeError, ValueError):
+                                pass
+                        try:
+                            s = self._metric_fn_list[metric](
+                                references=[gold_cast],
+                                predictions=[pred],
+                                **self._metric_fn_kwargs[metric],
+                            )
+                        except TypeError:
+                            s = self._metric_fn_list[metric]([gold_cast, pred])
+                        if isinstance(s, dict):
+                            s = s[metric]
+                        per_sample.append(s)
+                    result_score = (
+                        sum(per_sample) / len(per_sample) if per_sample else 0.0
+                    )
+                    # prefer exact_match as the binary signal for pass@k
+                    if passk_source is None or metric == "exact_match":
+                        passk_source = per_sample
                 else:
                     try:
                         result_score = self._metric_fn_list[metric](
@@ -1732,11 +1813,23 @@ class ConfigurableTask(Task):
                         result_dict[k] = v
                 else:
                     result_dict[metric] = result_score
+
+            # pass@k: emit the per-question K-binary correctness vector so the
+            # aggregation layer can compute unbiased pass@k. Only when k values are
+            # declared and the K samples were kept (avg_at_k filter + repeats>1).
+            if self.config.passk and is_avg_at_k and passk_source is not None:
+                result_dict["__passk__"] = [
+                    1.0 if s == 1.0 else 0.0 for s in passk_source
+                ]
         else:
             raise ValueError(
                 f"Passed invalid output_type '{self.OUTPUT_TYPE}' ! Please use one of ",
                 "'loglikelihood', 'loglikelihood_rolling', 'generate_until' or 'multiple_choice'",
             )
+
+        cluster_key = getattr(self.config, "cluster_key", None)
+        if cluster_key is not None:
+            result_dict["__cluster__"] = doc.get(cluster_key)
 
         return result_dict
 

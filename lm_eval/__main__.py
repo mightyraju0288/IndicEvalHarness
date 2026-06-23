@@ -99,6 +99,20 @@ def setup_parser() -> argparse.ArgumentParser:
         help="Number of examples in few-shot context",
     )
     parser.add_argument(
+        "--confidence_level",
+        type=float,
+        default=0.95,
+        metavar="C",
+        help="Confidence level for reported confidence intervals / standard errors (e.g. 0.95). Default 0.95.",
+    )
+    parser.add_argument(
+        "--resamples",
+        type=int,
+        default=1,
+        metavar="K",
+        help="Number of generations per question for generate_until tasks (sets Instance.repeats=K). Loglikelihood/multiple_choice tasks are deterministic and ignore this. Default 1.",
+    )
+    parser.add_argument(
         "--batch_size",
         "-b",
         type=str,
@@ -457,6 +471,8 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
         model_args=args.model_args,
         tasks=task_names,
         num_fewshot=args.num_fewshot,
+        confidence_level=args.confidence_level,
+        resamples=args.resamples,
         batch_size=args.batch_size,
         max_batch_size=args.max_batch_size,
         device=args.device,

@@ -5,6 +5,7 @@ task: null
 dataset_path: xnli
 dataset_name: null
 output_type: multiple_choice
+cluster_key: premise  # each premise paired with 3 hypotheses -> not IID
 training_split: train
 validation_split: validation
 doc_to_text: null

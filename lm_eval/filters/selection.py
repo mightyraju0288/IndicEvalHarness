@@ -40,6 +40,33 @@ class TakeKFilter(Filter):
         return map(lambda r: r[: self.k], resps)
 
 
+@register_filter("avg_at_k")
+class AvgAtKFilter(Filter):
+    """Keep all K extracted answers per question (no collapse to a single answer).
+
+    Unlike take_first / majority_vote, this filter does NOT reduce the K responses
+    to one. It passes the per-question list of K extracted answers through, so that
+    scoring (ConfigurableTask.process_results) can score each of the K against the
+    gold target and report the per-question mean correctness -- i.e. avg@k, one
+    score in [0, 1] -- which the usual summarize() SE/CI layer then consumes
+    unchanged.
+
+    Only meaningful when repeats > 1 (K == repeats). With K == 1 it degenerates to
+    a no-op (the mean over a single answer equals that answer's score). Optionally
+    pass `k` to truncate to the first k responses before averaging.
+    """
+
+    def __init__(self, k: int = None) -> None:
+        self.k = k
+
+    def apply(self, resps, docs):
+        def keep(inst):
+            inst = list(inst)
+            return inst[: self.k] if self.k is not None else inst
+
+        return map(keep, resps)
+
+
 @register_filter("majority_vote")
 class MajorityVoteFilter(Filter):
     def __init__(self) -> None:

@@ -7,6 +7,7 @@ test_split: test
 dataset_kwargs:
   trust_remote_code: True
 output_type: generate_until
+cluster_key: context  # many questions share one passage -> not IID
 doc_to_text: null
 doc_to_target: !function utils.doc_to_target
 generation_kwargs:

@@ -5,6 +5,7 @@ import pathlib
 import sys
 from typing import List, Optional, Tuple, Union
 
+from lm_eval.api.eval_stats import passk_question_scores, summarize
 from lm_eval.api.group import ConfigurableGroup
 from lm_eval.api.metrics import (
     aggregate_subtask_metrics,
@@ -14,6 +15,12 @@ from lm_eval.api.metrics import (
 )
 from lm_eval.api.task import Task
 from lm_eval.utils import positional_deprecated
+
+
+def _is_reserved_key(name) -> bool:
+    """Reserved per-sample keys use the __name__ pattern (e.g. __cluster__).
+    They carry metadata, not metrics, and must never be aggregated/scored."""
+    return isinstance(name, str) and name.startswith("__") and name.endswith("__")
 
 
 eval_logger = logging.getLogger(__name__)
@@ -102,8 +109,47 @@ class TaskOutput:
             group_alias=group_alias,
         )
 
-    def calculate_aggregate_metric(self, bootstrap_iters=100000) -> None:
+    def _resolve_clusters(self, raw_clusters, n_scores, metric):
+        """Decide clustering mode for one metric's per-sample cluster ids.
+
+        all ids present -> clustered ; none present -> IID (return None) ;
+        some-but-not-all present -> raise (malformed task; never half-cluster).
+        """
+        if raw_clusters is None:
+            return None
+        if len(raw_clusters) != n_scores:
+            raise ValueError(
+                f"Task '{self.task_name}' metric '{metric}': got "
+                f"{len(raw_clusters)} cluster ids for {n_scores} scores; "
+                "cluster ids must align 1:1 with scores."
+            )
+        present = [c is not None for c in raw_clusters]
+        if all(present):
+            return raw_clusters
+        if not any(present):
+            return None
+        raise ValueError(
+            f"Task '{self.task_name}' metric '{metric}': "
+            f"{sum(present)}/{len(present)} samples carry a __cluster__ id. "
+            "Clustering requires all samples or none to be clustered; refusing "
+            "to silently half-cluster. Check the task's cluster_key and data."
+        )
+
+    def calculate_aggregate_metric(self, bootstrap_iters=100000, confidence=0.95) -> None:
+        # Split reserved per-sample keys (__name__, e.g. __cluster__) out of the
+        # metric set: they are metadata and must NEVER be treated as metrics.
+        # __cluster__ ids are kept aligned (per filter) with the scores so they
+        # can drive clustered standard errors below.
+        reserved = collections.defaultdict(dict)
+        real_sample_metrics = {}
         for (metric, filter_key), items in self.sample_metrics.items():
+            if _is_reserved_key(metric):
+                reserved[metric][filter_key] = items
+            else:
+                real_sample_metrics[(metric, filter_key)] = items
+        cluster_by_filter = reserved.get("__cluster__", {})
+
+        for (metric, filter_key), items in real_sample_metrics.items():
             try:
                 agg_fn = self.task.aggregation()[metric]
             except KeyError:
@@ -127,6 +173,69 @@ class TaskOutput:
                 raise ValueError(
                     f"Received bootstrap_iters '{bootstrap_iters}' but expected an integer. Set to 0 to turn off stderr calculations."
                 )
+
+            # --- statistical rigor: clustered / CLT uncertainty summary ---
+            # Only valid where the aggregate is the per-question mean (acc, f1,
+            # exact_match, em, ...). Corpus-level aggregations (chrf/bleu/ter)
+            # and perplexity are not means of per-sample scores, so we skip them.
+            if agg_fn is mean:
+                clusters_arg = self._resolve_clusters(
+                    cluster_by_filter.get(filter_key), len(items), metric
+                )
+                summary = summarize(
+                    items, clusters=clusters_arg, confidence=confidence
+                )
+                # The reported stderr becomes the rigorous SE: clustered when a
+                # cluster id is present on every sample, otherwise the CLT SE.
+                self.agg_metrics[f"{metric}_stderr,{filter_key}"] = summary.se
+                self.agg_metrics[f"{metric}_mean,{filter_key}"] = summary.mean
+                self.agg_metrics[f"{metric}_ci_low,{filter_key}"] = summary.ci_reported[0]
+                self.agg_metrics[f"{metric}_ci_high,{filter_key}"] = summary.ci_reported[1]
+                self.agg_metrics[f"{metric}_n,{filter_key}"] = summary.n
+                self.agg_metrics[f"{metric}_clusters,{filter_key}"] = summary.num_clusters
+                self.agg_metrics[f"{metric}_stat_warnings,{filter_key}"] = summary.notes
+
+        # --- unbiased pass@k (opt-in via task config `passk: [...]`) ---
+        # Uses the per-question (n_questions, K) binary matrix carried by the
+        # reserved __passk__ key. For each declared k we compute one per-question
+        # pass@k score and feed it through the same summarize() SE/CI path.
+        passk_ks = getattr(self.task.config, "passk", None) or []
+        passk_by_filter = reserved.get("__passk__", {})
+        if passk_ks:
+            if not passk_by_filter:
+                eval_logger.warning(
+                    f"Task '{self.task_name}' declares passk={passk_ks} but no "
+                    "per-sample K data was found. pass@k requires repeats>1 and the "
+                    "`avg_at_k` filter to keep the K samples per question; skipping."
+                )
+            for filter_key, rows in passk_by_filter.items():
+                # rows: list of per-question binary vectors, each length K
+                K = len(rows[0]) if rows else 0
+                clusters_raw = cluster_by_filter.get(filter_key)
+                for k in passk_ks:
+                    if K <= k:
+                        eval_logger.warning(
+                            f"Task '{self.task_name}' filter '{filter_key}': "
+                            f"skipping pass@{k} because K={K} <= k={k} "
+                            "(need K > k samples per question)."
+                        )
+                        continue
+                    scores = passk_question_scores(rows, k)
+                    clusters_arg = self._resolve_clusters(
+                        clusters_raw, len(scores), f"pass@{k}"
+                    )
+                    summary = summarize(
+                        scores, clusters=clusters_arg, confidence=confidence
+                    )
+                    name = f"pass@{k}"
+                    self.agg_metrics[f"{name},{filter_key}"] = summary.mean
+                    self.agg_metrics[f"{name}_mean,{filter_key}"] = summary.mean
+                    self.agg_metrics[f"{name}_stderr,{filter_key}"] = summary.se
+                    self.agg_metrics[f"{name}_ci_low,{filter_key}"] = summary.ci_reported[0]
+                    self.agg_metrics[f"{name}_ci_high,{filter_key}"] = summary.ci_reported[1]
+                    self.agg_metrics[f"{name}_n,{filter_key}"] = summary.n
+                    self.agg_metrics[f"{name}_clusters,{filter_key}"] = summary.num_clusters
+                    self.agg_metrics[f"{name}_stat_warnings,{filter_key}"] = summary.notes
 
     def __repr__(self):
         return (
@@ -361,6 +470,9 @@ def consolidate_results(
         samples[task_output.task_name] = task_output.logged_samples
         higher_is_better[task_output.task_name] = task_output.task.higher_is_better()
         for (metric, filter_key), items in task_output.sample_metrics.items():
+            # reserved keys (e.g. __cluster__) are per-sample metadata, never metrics
+            if _is_reserved_key(metric):
+                continue
             metric_key = f"{metric},{filter_key}"
             results[task_output.task_name][metric_key] = task_output.agg_metrics[
                 metric_key
@@ -369,6 +481,26 @@ def consolidate_results(
             results[task_output.task_name][f"{metric}_stderr,{filter_key}"] = (
                 task_output.agg_metrics[f"{metric}_stderr,{filter_key}"]
             )
+            # surface the statistical-rigor family emitted by calculate_aggregate_metric
+            for suffix in (
+                "_mean",
+                "_ci_low",
+                "_ci_high",
+                "_n",
+                "_clusters",
+                "_stat_warnings",
+            ):
+                agg_key = f"{metric}{suffix},{filter_key}"
+                if agg_key in task_output.agg_metrics:
+                    results[task_output.task_name][agg_key] = task_output.agg_metrics[
+                        agg_key
+                    ]
+        # pass@k metrics are derived (from the reserved __passk__ matrix) and have
+        # no sample_metrics entry, so surface them directly from agg_metrics.
+        for agg_key, value in task_output.agg_metrics.items():
+            if agg_key.startswith("pass@"):
+                results[task_output.task_name][agg_key] = value
+                results[task_output.task_name]["samples"] = task_output.sample_len
     return results, samples, configs, versions, num_fewshot, higher_is_better
 
 

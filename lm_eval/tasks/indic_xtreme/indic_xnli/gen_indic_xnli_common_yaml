@@ -9,6 +9,7 @@ test_split: test
 dataset_kwargs:
   trust_remote_code: True
 output_type: generate_until
+cluster_key: premise  # each premise paired with 3 hypotheses -> not IID
 doc_to_text: !function utils.doc_to_text
 doc_to_target: label
 generation_kwargs:

@@ -9,6 +9,7 @@ dataset_kwargs:
   field: examples
   trust_remote_code: True
 output_type: generate_until
+cluster_key: context  # many questions share one passage -> not IID
 doc_to_text: !function utils.doc_to_text
 doc_to_target: !function utils.doc_to_target
 generation_kwargs:

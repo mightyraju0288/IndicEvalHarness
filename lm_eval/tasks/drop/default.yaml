@@ -8,6 +8,7 @@ doc_to_text: "{{passage}} {{question}}"
 doc_to_target: "{{ answer|join(',')}}"
 target_delimiter: ""
 process_results: !function utils.process_results
+cluster_key: passage  # many questions share one passage -> not IID
 should_decontaminate: true
 doc_to_decontamination_query: "{{passage}} {{question}}"
 generation_kwargs:

@@ -14,5 +14,11 @@ metric_list:
   - metric: acc
     aggregation: mean
     higher_is_better: True
+  # length-robustness check alongside acc: choices are full option text
+  # (incl. fill-in-the-blank / match-the-column / assertion-reasoning), so
+  # their token/char lengths vary and bias plain acc toward shorter options.
+  - metric: acc_norm
+    aggregation: mean
+    higher_is_better: True
 metadata:
   version: 1.0

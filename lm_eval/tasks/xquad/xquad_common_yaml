@@ -10,6 +10,7 @@ validation_split: validation
 doc_to_text: null
 doc_to_target: '{{answers["text"][0]}}'
 process_results: !function utils.process_results_qa
+cluster_key: context  # many questions share one passage -> not IID
 target_delimiter: ' '
 generation_kwargs:
   until:

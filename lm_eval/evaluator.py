@@ -52,6 +52,8 @@ def simple_evaluate(
     model_args: Optional[Union[str, dict]] = None,
     tasks: Optional[List[Union[str, dict, object]]] = None,
     num_fewshot: Optional[int] = None,
+    confidence_level: float = 0.95,
+    resamples: int = 1,
     batch_size: Optional[Union[int, str]] = None,
     max_batch_size: Optional[int] = None,
     device: Optional[str] = None,
@@ -91,6 +93,11 @@ def simple_evaluate(
         List of task names or Task objects. Task objects will be taken to have name task.EVAL_HARNESS_NAME if defined and type(task).__name__ otherwise.
     :param num_fewshot: int
         Number of examples in few-shot context
+    :param confidence_level: float
+        Confidence level for reported confidence intervals / standard errors (e.g. 0.95).
+    :param resamples: int
+        Number of generations per question for generate_until tasks (sets Instance.repeats=K).
+        Loglikelihood/multiple_choice tasks are deterministic and ignore this. Default 1.
     :param batch_size: int or str, optional
         Batch size for model
     :param max_batch_size: int, optional
@@ -305,6 +312,15 @@ def simple_evaluate(
                     eval_logger.info(
                         f"{task_obj.config.task}: Using gen_kwargs: {task_obj.config.generation_kwargs}"
                     )
+                    # generate_until tasks honor --resamples: produce K generations
+                    # per question via Instance.repeats (set from config.repeats).
+                    # loglikelihood/multiple_choice tasks are deterministic and are
+                    # intentionally left at their config default (repeats=1).
+                    if resamples != 1:
+                        eval_logger.info(
+                            f"{task_obj.config.task}: Setting repeats={resamples} (--resamples)"
+                        )
+                        task_obj.set_config(key="repeats", value=resamples)
 
                 if predict_only:
                     eval_logger.info(
@@ -369,6 +385,7 @@ def simple_evaluate(
         fewshot_as_multiturn=fewshot_as_multiturn,
         verbosity=verbosity,
         confirm_run_unsafe_code=confirm_run_unsafe_code,
+        confidence_level=confidence_level,
     )
     if verbosity is not None:
         setup_logging(verbosity=verbosity)
@@ -432,6 +449,7 @@ def evaluate(
     fewshot_as_multiturn: bool = False,
     verbosity: str = "INFO",
     confirm_run_unsafe_code: bool = False,
+    confidence_level: float = 0.95,
 ):
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -466,6 +484,8 @@ def evaluate(
         Verbosity level for logging
     :param confirm_run_unsafe_code: bool
         Whether to confirm running tasks marked as unsafe.
+    :param confidence_level: float
+        Confidence level for reported confidence intervals / standard errors (e.g. 0.95).
     :return
         Dictionary of results
     """
@@ -643,7 +663,14 @@ def evaluate(
                             req.filtered_resps[filter_key] for req in requests
                         ],
                         "filter": filter_key,
-                        "metrics": list(metrics.keys()),
+                        # reserved keys (e.g. __cluster__) are kept as plain
+                        # per-sample fields (via example.update below) but are
+                        # not listed as metrics.
+                        "metrics": [
+                            m
+                            for m in metrics.keys()
+                            if not (m.startswith("__") and m.endswith("__"))
+                        ],
                         "doc_hash": hash_string(
                             json.dumps(
                                 requests[0].doc,
@@ -695,7 +722,9 @@ def evaluate(
         ### Aggregate results over all datapoints ###
         # aggregate results ; run bootstrap CIs
         for task_output in eval_tasks:
-            task_output.calculate_aggregate_metric(bootstrap_iters=bootstrap_iters)
+            task_output.calculate_aggregate_metric(
+                bootstrap_iters=bootstrap_iters, confidence=confidence_level
+            )
         (
             results,
             samples,
