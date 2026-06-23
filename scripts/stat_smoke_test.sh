@@ -29,7 +29,8 @@ echo " model=${MODEL_ID}  limit=${LIMIT}  device=${DEVICE}  K=${K}"
 echo " out=${OUT}"
 echo "=================================================================="
 
-mkdir -p "${OUT}" custom_tasks
+TASKS_DIR="${OUT}/custom_tasks"
+mkdir -p "${OUT}" "${TASKS_DIR}"
 
 # ---- step 0: library + flags sanity (no GPU needed) ----
 echo "--- [0] eval_stats import + CLI flags ---"
@@ -38,7 +39,7 @@ python -m lm_eval --help | grep -E -- "--confidence_level|--resamples" || { echo
 
 # ---- write a custom generative task: gsm8k + avg_at_k filter + passk ----
 # do_sample=true so the K resamples differ (otherwise pass@k is degenerate).
-cat > custom_tasks/gsm8k_stat.yaml <<'YAML'
+cat > "${TASKS_DIR}/gsm8k_stat.yaml" <<'YAML'
 task: gsm8k_stat
 dataset_path: gsm8k
 dataset_name: main
@@ -97,7 +98,7 @@ run python -m lm_eval --model hf --model_args "${MARGS}" \
 
 # ---- [D] generative avg@k + pass@k with real resampling ----
 run python -m lm_eval --model hf --model_args "${MARGS}" \
-  --tasks gsm8k_stat --include_path ./custom_tasks --device "${DEVICE}" \
+  --tasks gsm8k_stat --include_path "${TASKS_DIR}" --device "${DEVICE}" \
   --batch_size "${BATCH}" --limit "${LIMIT}" --resamples "${K}" \
   --log_samples --output_path "${OUT}/gsm8k_stat"
 
