@@ -1,0 +1,23 @@
+# keep the build context (and image) small / reproducible
+.git
+**/__pycache__
+**/*.pyc
+*.egg-info
+build/
+dist/
+# local virtualenvs
+venv/
+.venv/
+# run outputs / scratch / logs (never bake these into the image)
+out/
+stat_smoke_out/
+hfcache/
+_tmp_*/
+_val_*/
+_audit_out*
+*.log
+*.sif
+# editor / OS cruft
+.vscode/
+.idea/
+.DS_Store
